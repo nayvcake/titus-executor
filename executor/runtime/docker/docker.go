@@ -1542,15 +1542,7 @@ func (r *DockerRuntime) k8sContainerToDockerConfigs(v1Container v1.Container, ma
 	b := true
 	// What docker calls "command", is what k8s calls "Args"
 	dockerCmd := v1Container.Args
-	// What docker calls "entrypoint", k8s calls "command", but in addition, we prepend tinit
-	// The reason we do this is because, even with init=true, docker will only inject tini
-	// on containers running in a private pid namespace.
-	// On titus, we want tini on *every* container, because it gives us features like stdout/err
-	// TODO: get the entrypoint that comes from the *image* and use it here if `v1Container.Command` is null
-	// Because as is, we are *setting* the entrypoint all the time here, which means docker is going
-	// to ignore whatever entrypoing is on the *image*. We want the normal docker behavior here,
-	// but we *also* want tini.
-	dockerEntrypoint := append([]string{"/sbin/docker-init", "-s", "--"}, v1Container.Command...)
+	dockerEntrypoint := r.computeDockerEntrypoint(v1Container)
 	dockerContainerConfig := &container.Config{
 		// Hostname must be empty here because setting the hostname is incompatible with
 		// a container:foo network mode
@@ -1585,6 +1577,27 @@ func (r *DockerRuntime) k8sContainerToDockerConfigs(v1Container v1.Container, ma
 	// Nothing extra is needed here, because networking is defined in the HostConfig referencing the main container
 	dockerNetworkConfig := &network.NetworkingConfig{}
 	return dockerContainerConfig, dockerHostConfig, dockerNetworkConfig
+}
+
+func (r *DockerRuntime) computeDockerEntrypoint(v1Container v1.Container) []string {
+	// What docker calls "entrypoint", k8s calls "command", but in addition, we prepend tinit
+	// The reason we do this is because, even with init=true, docker will only inject tini
+	// on containers running in a private pid namespace.
+	// On titus, we want tini on *every* container, because it gives us features like stdout/err
+	entrypoint := v1Container.Command
+	if len(entrypoint) == 0 {
+		// If `v1Container.Command` is null, then we need to look at the image to see what the "real"
+		// entrypoint is.
+		// Because, as is, we are *setting* the entrypoint all the time here, which means docker is going
+		// to ignore whatever entrypoint is on the *image*. We want the normal docker behavior here,
+		// but we *also* want tini.
+		// if we want both, then we must inspect the image and get what docker would have used
+		inspectOutput, _ := r.client.ContainerInspect(context.TODO(), r.c.ID())
+		entrypoint = inspectOutput.Config.Entrypoint
+	}
+
+	dockerEntrypoint := append([]string{"/sbin/docker-init", "-s", "--"}, entrypoint...)
+	return dockerEntrypoint
 }
 
 func v1ConatinerEnvToList(v1Env []v1.EnvVar) []string {
