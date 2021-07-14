@@ -1306,6 +1306,32 @@ func TestBasicMultiContainer(t *testing.T) {
 	}
 }
 
+func TestOtherUserContaintainerFailsTask(t *testing.T) {
+	wrapTestStandalone(t)
+	skipIfNotPod(t)
+	testEntrypointOld := `/bin/sh -c "sleep 5"`
+	ji := &JobInput{
+		ImageName:  busybox.name,
+		Version:    busybox.tag,
+		UsePodSpec: UseV1PodspecInTest,
+		ExtraContainers: []corev1.Container{
+			{
+				// This exit container is purposely designed to exit with a sentinel code, 42
+				// For user containers, if one dies, the whole task dies, and should not just go
+				// limping along with only the one container running.
+				Name:    "exit-sentinel",
+				Image:   busybox.name + `:` + busybox.tag,
+				Command: []string{"/bin/sh", "-c"},
+				Args:    []string{"sleep 1s; exit 42"},
+			},
+		},
+		EntrypointOld: testEntrypointOld,
+	}
+	if !RunJobExpectingFailure(t, ji) {
+		t.Fail()
+	}
+}
+
 func TestMultiContainerDoesPlatformFirst(t *testing.T) {
 	wrapTestStandalone(t)
 	skipIfNotPod(t)
@@ -1315,9 +1341,9 @@ func TestMultiContainerDoesPlatformFirst(t *testing.T) {
 	// It will only work if the user sentinel sidecar is seen running by the time we start.
 	testEntrypointOld := "pgrep -fx '/bin/sleep 430'"
 	// The main container and the user-sentinel are both 'user' containers,
-	// So we want the main container to waid just a little bit for the user-sentinel
+	// So we want the main container to wait just a little bit for the user-sentinel
 	// to come up, report back if the platform-sentinel is running or not, and then continue
-	testEntrypointOld = `/bin/sh -c "sleep 3;` + testEntrypointOld + `"`
+	testEntrypointOld = `/bin/sh -c "sleep 10;` + testEntrypointOld + `"`
 
 	ji := &JobInput{
 		ImageName:  busybox.name,
