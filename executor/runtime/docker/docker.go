@@ -863,6 +863,13 @@ func (r *DockerRuntime) createVolumeContainerFunc(sOpts *runtimeTypes.ServiceOpt
 
 // createVolumeContainer creates a container to be used as a source for volumes to be mounted via VolumesFrom
 func (r *DockerRuntime) createVolumeContainer(ctx context.Context, containerName *string, cfg *container.Config, hostConfig *container.HostConfig) error { // nolint: gocyclo
+	ctx, span := trace.StartSpan(ctx, "DockerRuntime.createVolumeContainer")
+	defer span.End()
+
+	span.AddAttributes(
+		trace.StringAttribute("imageName", cfg.Image),
+	)
+
 	image := cfg.Image
 	if image == "" {
 		return fmt.Errorf("No image set for %s, can't create a volume container for it", *containerName)
@@ -1035,6 +1042,9 @@ func (r *DockerRuntime) Prepare(ctx context.Context) error { // nolint: gocyclo
 
 	if r.cfg.UseNewNetworkDriver {
 		group.Go(func(ctx context.Context) error {
+			ctx, span := trace.StartSpan(ctx, "prepareNetwork")
+			defer span.End()
+
 			prepareNetworkStartTime := time.Now()
 			cf, netErr := prepareNetworkDriver(ctx, r.dockerCfg, r.c)
 			if netErr == nil {
@@ -1378,7 +1388,7 @@ func (r *DockerRuntime) setupTini(ctx context.Context, listener *net.UnixListene
 func (r *DockerRuntime) Start(parentCtx context.Context, pod *v1.Pod) (string, *runtimeTypes.Details, <-chan runtimeTypes.StatusMessage, error) {
 	ctx, cancel := context.WithTimeout(parentCtx, r.dockerCfg.startTimeout)
 	defer cancel()
-	ctx, span := trace.StartSpan(ctx, "Start")
+	ctx, span := trace.StartSpan(ctx, "DockerRuntime.Start")
 	defer span.End()
 
 	var err error
@@ -1478,12 +1488,14 @@ func (r *DockerRuntime) Start(parentCtx context.Context, pod *v1.Pod) (string, *
 	if err != nil {
 		eventCancel()
 		err = fmt.Errorf("container prestart error inspecting main container: %w", err)
+		tracehelpers.SetStatus(err, span)
 		return "", nil, statusMessageChan, err
 	}
 	mainContainerRoot := getMainContainerRoot(inspectOutput)
 	err = r.startUserContainers(ctx, pod, r.c.ID(), tiniConn, mainContainerRoot)
 	if err != nil {
 		eventCancel()
+		tracehelpers.SetStatus(err, span)
 		return "", nil, statusMessageChan, err
 	}
 
@@ -1638,6 +1650,9 @@ func (r *DockerRuntime) startAllUserContainers(ctx context.Context, pod *v1.Pod,
 }
 
 func (r *DockerRuntime) startPlatformDefinedContainers(ctx context.Context) error {
+	ctx, span := trace.StartSpan(ctx, "DockerRuntime.startPlatformDefinedContainers")
+	defer span.End()
+
 	l := log.WithField("taskID", r.c.TaskID())
 	group := groupWithContext(ctx)
 	for _, c := range r.c.ExtraPlatformContainers() {
@@ -1656,7 +1671,9 @@ func (r *DockerRuntime) startPlatformDefinedContainers(ctx context.Context) erro
 			return nil
 		})
 	}
-	return group.Wait()
+	err := group.Wait()
+	tracehelpers.SetStatus(err, span)
+	return err
 }
 
 func (r *DockerRuntime) startUserDefinedContainers(ctx context.Context, tiniConn *net.UnixConn) error {
@@ -1696,6 +1713,9 @@ func (r *DockerRuntime) startUserDefinedContainers(ctx context.Context, tiniConn
 }
 
 func (r *DockerRuntime) createExtraContainerInDocker(ctx context.Context, v1Container v1.Container, mainContainerID string, mainContainerRoot string) (string, error) {
+	ctx, span := trace.StartSpan(ctx, "DockerRuntime.createExtraContainerInDocker")
+	defer span.End()
+
 	l := log.WithField("taskID", r.c.TaskID())
 	containerName := r.c.TaskID() + "-" + v1Container.Name
 	dockerContainerConfig, dockerHostConfig, dockerNetworkConfig := r.k8sContainerToDockerConfigs(v1Container, mainContainerID, mainContainerRoot)
@@ -1705,6 +1725,7 @@ func (r *DockerRuntime) createExtraContainerInDocker(ctx context.Context, v1Cont
 	}).Infof("Creating other container in docker: %s", v1Container.Name)
 	containerCreateBody, err := r.client.ContainerCreate(ctx, dockerContainerConfig, dockerHostConfig, dockerNetworkConfig, containerName)
 	if err != nil {
+		tracehelpers.SetStatus(err, span)
 		return "", err
 	}
 	l.Debugf("Finished creating container %s, CID: %s, Env: %+v", v1Container.Name, containerCreateBody.ID, dockerContainerConfig.Env)
@@ -2312,7 +2333,7 @@ func (r *DockerRuntime) setupGPU(ctx context.Context) error {
 
 // Kill uses the Docker API to terminate a container and notifies the VPC driver to tear down its networking
 func (r *DockerRuntime) Kill(ctx context.Context, wasKilled bool) error { // nolint: gocyclo
-	ctx, span := trace.StartSpan(ctx, "Kill")
+	ctx, span := trace.StartSpan(ctx, "DockerRuntime.Kill")
 	defer span.End()
 
 	var errs *multierror.Error
@@ -2375,8 +2396,9 @@ stopped:
 
 // Cleanup runs the registered callbacks for a container
 func (r *DockerRuntime) Cleanup(parentCtx context.Context) error {
-	_, span := trace.StartSpan(parentCtx, "Cleanup")
+	_, span := trace.StartSpan(parentCtx, "DockerRuntime.Cleanup")
 	defer span.End()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ctx = trace.NewContext(ctx, span)

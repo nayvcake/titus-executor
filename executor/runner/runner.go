@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -21,6 +22,10 @@ import (
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
+)
+
+var (
+	errTaskKilledBeforeCreation = errors.New("Task was killed before Task was created")
 )
 
 // Task contains all information for running a task
@@ -115,7 +120,7 @@ func (r *Runner) startRunner(ctx context.Context, startTime time.Time) {
 	defer close(r.StoppedChan)
 
 	updateChan := make(chan update, 10)
-	go r.runMainContainerAndStartSidecars(ctx, startTime, updateChan)
+	go r.runMainContainerAndStartSidecarsAndWait(ctx, startTime, updateChan)
 
 	var lastUpdate *update
 	for update := range updateChan {
@@ -146,7 +151,14 @@ type update struct {
 	details *runtimeTypes.Details
 }
 
+func (u update) String() string {
+	return fmt.Sprintf("update{msg=%q status=%s details=%v}", u.msg, u.status.String(), u.details)
+}
+
 func (r *Runner) prepareContainer(ctx context.Context) update {
+	ctx, span := trace.StartSpan(ctx, "prepareContainer")
+	defer span.End()
+
 	logger.G(ctx).Debug("Running prepare on main container")
 	prepareCtx, prepareCancel := context.WithCancel(ctx)
 	defer prepareCancel()
@@ -185,18 +197,23 @@ func getContainerNames(pod *v1.Pod) []string {
 	return names
 }
 
-// This is just splitting the "run" part of the of the runner
-func (r *Runner) runMainContainerAndStartSidecars(ctx context.Context, startTime time.Time, updateChan chan update) {
-	defer close(updateChan)
+func (r *Runner) runMainContainerAndStartSidecars(ctx context.Context, updateChan chan update) (*runtimeTypes.Details, <-chan runtimeTypes.StatusMessage, error) {
+	ctx, span := trace.StartSpan(ctx, "runMainContainerAndStartSidecars")
+	defer span.End()
+
 	select {
 	case <-r.killChan:
-		logger.G(ctx).Error("Task was killed before Task was created")
-		return
+		tracehelpers.SetStatus(errTaskKilledBeforeCreation, span)
+		logger.G(ctx).WithError(errTaskKilledBeforeCreation).Error("Task was killed")
+		return nil, nil, errTaskKilledBeforeCreation
 	case <-ctx.Done():
-		logger.G(ctx).Error("Task context was terminated before Task was created")
-		return
+		err := fmt.Errorf("Task context was terminated before Task was created: %w", ctx.Err())
+		tracehelpers.SetStatus(errTaskKilledBeforeCreation, span)
+		logger.G(ctx).WithError(err).Error("Task context was terminated")
+		return nil, nil, err
 	default:
 	}
+
 	r.maybeSetDefaultTags(ctx) // initialize metrics.Reporter default tags
 	containerNames := getContainerNames(r.pod)
 	startingMsg := fmt.Sprintf("starting %d container(s): %s", len(containerNames), containerNames)
@@ -205,8 +222,10 @@ func (r *Runner) runMainContainerAndStartSidecars(ctx context.Context, startTime
 	prepareUpdate := r.prepareContainer(ctx)
 	if prepareUpdate.status.IsTerminalStatus() {
 		updateChan <- prepareUpdate
-		logger.G(ctx).WithField("prepareUpdate", prepareUpdate).Debug("Prepare was terminal")
-		return
+		err := fmt.Errorf("Preparing container returned terminate status: %v", prepareUpdate)
+		tracehelpers.SetStatus(err, span)
+		logger.G(ctx).WithError(err).WithField("prepareUpdate", prepareUpdate).Debug("Prepare was terminal")
+		return nil, nil, err
 	}
 
 	logger.G(ctx).Info(startingMsg)
@@ -222,15 +241,18 @@ func (r *Runner) runMainContainerAndStartSidecars(ctx context.Context, startTime
 		}
 		logger.G(ctx).Info("Returning TASK_LOST for Task: ", err)
 		updateChan <- update{status: titusdriver.Lost, msg: err.Error(), details: details}
-		return
+		tracehelpers.SetStatus(err, span)
+		return details, statusChan, err
 	}
 	logger.G(ctx).Infof("started %d container(s): %s, now monitoring for container status", len(containerNames), containerNames)
 
 	err = r.maybeSetupExternalLogger(ctx, logDir)
 	if err != nil {
-		logger.G(ctx).Error("Unable to setup logging for container: ", err)
+		err = fmt.Errorf("Unable to setup logging for container: %w", err)
+		logger.G(ctx).WithError(err).Error("Unable to setup logging for container")
 		updateChan <- update{status: titusdriver.Lost, msg: err.Error(), details: details}
-		return
+		tracehelpers.SetStatus(err, span)
+		return details, statusChan, err
 	}
 
 	if details == nil {
@@ -238,6 +260,18 @@ func (r *Runner) runMainContainerAndStartSidecars(ctx context.Context, startTime
 	}
 	r.metrics.Counter("titus.executor.taskLaunched", 1, nil)
 
+	tracehelpers.SetStatus(err, span)
+	return details, statusChan, err
+}
+
+// This is just splitting the "run" part of the of the runner
+func (r *Runner) runMainContainerAndStartSidecarsAndWait(ctx context.Context, startTime time.Time, updateChan chan update) {
+	defer close(updateChan)
+
+	details, statusChan, err := r.runMainContainerAndStartSidecars(ctx, updateChan)
+	if err != nil {
+		logger.G(ctx).WithError(err).Error("Could not start container")
+	}
 	r.monitorMainContainer(ctx, startTime, statusChan, updateChan, details)
 }
 
@@ -439,6 +473,12 @@ func (r *Runner) maybeSetupExternalLogger(ctx context.Context, logDir string) er
 
 func (r *Runner) updateStatusWithDetails(ctx context.Context, status titusdriver.TitusTaskState, msg string, details *runtimeTypes.Details) {
 	l := logger.G(ctx).WithField("msg", msg).WithField("taskStatus", status)
+	ctx, span := trace.StartSpan(ctx, "runMainContainerAndStartSidecars")
+	defer span.End()
+	span.AddAttributes(
+		trace.StringAttribute("status", status.String()),
+		trace.StringAttribute("msg", msg),
+	)
 	select {
 	case r.UpdatesChan <- Update{
 		TaskID:                  r.container.TaskID(),
@@ -451,6 +491,7 @@ func (r *Runner) updateStatusWithDetails(ctx context.Context, status titusdriver
 		l.Info("Updating Task status")
 	case <-ctx.Done():
 		l.Warn("Not sending update, because UpdatesChan Blocked, (or closed), and context completed")
+		tracehelpers.SetStatus(ctx.Err(), span)
 	}
 }
 
